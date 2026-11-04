@@ -1,0 +1,18 @@
+{
+  "name": "task-orchestrator",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test",
+    "smoke:claude": "node scripts/smoke-claude.mjs",
+    "smoke:claude-review": "node scripts/smoke-claude-review.mjs",
+    "smoke:codex": "node scripts/smoke-codex.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "happy-dom": "^21.0.4"
+  }
+}

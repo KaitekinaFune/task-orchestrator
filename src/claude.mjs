@@ -6,20 +6,27 @@ import { promisify } from 'node:util';
 export const claudePermissionMode = profile => profile === 'deepseek' ? 'acceptEdits' : 'auto';
 export const validSessionId = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 // Plan mode is the CLI's read-only boundary; a reviewer also has no tools for edits or for leaving that mode.
-export function claudeArgs({ profile, model, resumeSessionId, allowedTools = [], readOnly = false, schemaPath }) {
-  return ['--print', '--output-format', 'stream-json', '--verbose', '--permission-mode', readOnly ? 'plan' : claudePermissionMode(profile), '--permission-prompts', 'none',
-    ...(readOnly ? ['--disallowedTools', 'Edit', 'Write', 'NotebookEdit', 'ExitPlanMode', '--no-session-persistence'] : []),
+// The supervisor has no tools at all, so its answer can only ever be a structured action; plan mode would only bias that choice.
+export function claudeArgs({ profile, model, resumeSessionId, allowedTools = [], readOnly = false, noTools = false, schemaPath, images = [] }) {
+  return ['--print', ...(images.length ? ['--input-format', 'stream-json'] : []), '--output-format', 'stream-json', '--verbose', '--permission-mode', noTools ? 'default' : readOnly ? 'plan' : claudePermissionMode(profile), '--permission-prompts', 'none',
+    ...(noTools ? ['--tools', '', '--strict-mcp-config', '--no-session-persistence'] : readOnly ? ['--disallowedTools', 'Edit', 'Write', 'NotebookEdit', 'ExitPlanMode', '--no-session-persistence'] : []),
     ...(schemaPath ? ['--json-schema', JSON.stringify(JSON.parse(readFileSync(schemaPath, 'utf8')))] : []),
     ...(allowedTools.length ? ['--allowedTools', ...allowedTools] : []), ...(model ? ['--model', model] : []), ...(resumeSessionId ? ['--resume', resumeSessionId] : [])];
 }
-export function launchClaude({ cwd, environment, prompt, resumeSessionId, ...options }) {
+// Plain text stays the input of a run without pictures, so only runs that need it depend on the streaming format.
+export function claudeInput(prompt, images = []) {
+  if (!images.length) return prompt;
+  const content = [...images.map(image => ({ type: 'image', source: { type: 'base64', media_type: image.type, data: readFileSync(image.path).toString('base64') } })), { type: 'text', text: prompt }];
+  return `${JSON.stringify({ type: 'user', message: { role: 'user', content } })}\n`;
+}
+export function launchClaude({ cwd, environment, prompt, resumeSessionId, images = [], ...options }) {
   if (resumeSessionId !== undefined && !validSessionId(resumeSessionId)) throw new Error('Invalid session ID');
-  const args = claudeArgs({ ...options, resumeSessionId });
+  const args = claudeArgs({ ...options, resumeSessionId, images }), input = claudeInput(prompt, images);
   const child = spawn(process.platform === 'win32' ? 'claude.exe' : 'claude', args, {
     cwd, env: environment, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32'
   });
   child.stdin.on('error', () => {});
-  child.stdin.end(prompt);
+  child.stdin.end(input);
   return child;
 }
 export async function stopTree(child) {
@@ -61,15 +68,29 @@ export function permissionDenials(raw, secrets = []) {
   return denials;
 }
 
+const count = value => Number.isFinite(value) && value >= 0 ? value : 0;
+const usageEntry = (model, input, output, cacheRead, cacheWrite, costUsd = null) => ({ model: typeof model === 'string' ? model.slice(0, 120) : '', input: count(input), output: count(output), cacheRead: count(cacheRead), cacheWrite: count(cacheWrite), costUsd: Number.isFinite(costUsd) ? costUsd : null });
+function limitWindows(info) {
+  const windows = Object.entries(info?.unifiedWindows && typeof info.unifiedWindows === 'object' ? info.unifiedWindows : {})
+    .filter(([, item]) => Number.isFinite(item?.utilization))
+    .map(([name, item]) => ({ name: name.slice(0, 40), utilization: Math.min(Math.max(item.utilization, 0), 1), resetsAt: Number.isFinite(item.resetsAt) ? new Date(item.resetsAt * 1000).toISOString() : null }));
+  return windows.length ? windows : null;
+}
+
 // Unknown events may be ignored; invalid JSON and invalid final results fail closed.
 export function claudeStream(onOutput) {
-  let pending = '', result = null, invalid = false, denied = false, sessionId;
+  let pending = '', result = null, invalid = false, denied = false, sessionId, initModel = '', limits = null;
+  const messages = new Map();
   let lastAssistantText = new Set();
   function line(value) {
     if (!value.trim()) return;
     let event;
     try { event = JSON.parse(value); } catch { invalid = true; return; }
     if (!event || typeof event.type !== 'string') { invalid = true; return; }
+    if (event.type === 'system' && event.subtype === 'init' && typeof event.model === 'string') initModel = event.model;
+    if (event.type === 'rate_limit_event') { const windows = limitWindows(event.rate_limit_info); if (windows) limits = { observedAt: new Date().toISOString(), windows }; }
+    // A stopped process never sends the totals, so usage is also kept per message; one message arrives in several events.
+    if (event.type === 'assistant' && event.message?.usage && typeof event.message.id === 'string') messages.set(event.message.id, event.message);
     if (event.type === 'assistant' && Array.isArray(event.message?.content)) {
       const texts = event.message.content.filter(block => block.type === 'text' && typeof block.text === 'string').map(block => block.text);
       if (texts.length && !event.parent_tool_use_id) lastAssistantText = new Set(['', '\n', '\n\n'].map(separator => texts.join(separator).trim()));
@@ -94,6 +115,21 @@ export function claudeStream(onOutput) {
   return {
     sessionId() { return !invalid ? sessionId : undefined; },
     denials() { return Array.isArray(result?.permission_denials) ? result.permission_denials : []; },
+    errorText() { return result?.is_error && typeof result.result === 'string' ? result.result.slice(0, 2000) : ''; },
+    cost() { return typeof result?.total_cost_usd === 'number' ? result.total_cost_usd : 0; },
+    usage() {
+      const exact = result?.modelUsage && typeof result.modelUsage === 'object' ? Object.entries(result.modelUsage) : [];
+      if (exact.length) return { models: exact.map(([model, item]) => usageEntry(model, item?.inputTokens, item?.outputTokens, item?.cacheReadInputTokens, item?.cacheCreationInputTokens, item?.costUSD)), partial: false, limits };
+      if (result?.usage) return { models: [usageEntry(initModel, result.usage.input_tokens, result.usage.output_tokens, result.usage.cache_read_input_tokens, result.usage.cache_creation_input_tokens, result.total_cost_usd)], partial: false, limits };
+      const models = new Map();
+      for (const { model, usage } of messages.values()) {
+        const entry = usageEntry(model ?? initModel, usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens);
+        const known = models.get(entry.model);
+        if (!known) models.set(entry.model, entry);
+        else for (const field of ['input', 'output', 'cacheRead', 'cacheWrite']) known[field] += entry[field];
+      }
+      return { models: [...models.values()], partial: !!models.size, limits };
+    },
     finalText() {
       const structured = result?.structured_output;
       return structured && typeof structured === 'object' ? JSON.stringify(structured) : typeof result?.result === 'string' ? result.result : '';

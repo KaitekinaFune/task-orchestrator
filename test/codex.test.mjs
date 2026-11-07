@@ -17,6 +17,12 @@ test('Codex parses fragmented JSONL and fails closed on malformed or incomplete 
   }
   assert.equal(parse(events, 1).status, 'ошибка');
 });
+test('Codex usage separates the cached part of the input and names no model or price', () => {
+  const parser = codexStream(() => {});
+  assert.deepEqual(parser.usage().models, [], 'nothing is invented before the turn ends');
+  parser.push(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 30, output_tokens: 7 } })}\n`);
+  assert.deepEqual(parser.usage().models, [{ model: '', input: 70, output: 7, cacheRead: 30, cacheWrite: 0, costUsd: null }]);
+});
 test('Codex executor and reviewer preserve sandbox boundaries and exact session ID', () => {
   assert.deepEqual(codexArgs(), ['-a', 'never', 'exec', '--sandbox', 'workspace-write', '--json', '--color', 'never', '-']);
   const review = codexArgs({ readOnly: true, schemaPath: 'C:/schema.json', model: 'test-model' });

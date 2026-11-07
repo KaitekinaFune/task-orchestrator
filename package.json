@@ -5,9 +5,8 @@
   "scripts": {
     "start": "node src/server.mjs",
     "test": "node --test",
-    "smoke:claude": "node scripts/smoke-claude.mjs",
-    "smoke:claude-review": "node scripts/smoke-claude-review.mjs",
-    "smoke:codex": "node scripts/smoke-codex.mjs"
+    "smoke:supervisor": "node scripts/smoke-supervisor.mjs",
+    "smoke:images": "node scripts/smoke-images.mjs"
   },
   "engines": {
     "node": ">=22"

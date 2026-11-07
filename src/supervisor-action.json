@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action", "reason", "workers", "check_ids", "question", "summary", "outcome"],
+  "properties": {
+    "action": { "type": "string", "enum": ["run_workers", "run_checks", "get_diff", "ask_user", "finish"] },
+    "reason": { "type": "string" },
+    "workers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "agent", "access", "prompt", "continue_worker"],
+        "properties": {
+          "name": { "type": "string" },
+          "agent": { "type": "string" },
+          "access": { "type": "string", "enum": ["read", "write"] },
+          "prompt": { "type": "string" },
+          "continue_worker": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "check_ids": { "type": "array", "items": { "type": "string" } },
+    "question": { "type": ["string", "null"] },
+    "summary": { "type": ["string", "null"] },
+    "outcome": { "type": ["string", "null"], "enum": ["done", "blocked", null] }
+  }
+}

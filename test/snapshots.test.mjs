@@ -8,7 +8,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { captureWorkspace } from '../src/workspace.mjs';
 import { createSnapshots, parseDiffSummary, splitPatch } from '../src/snapshots.mjs';
-import { createAttempts } from '../src/attempts.mjs';
+import { createRuns } from '../src/runs.mjs';
+import { defaultSettings } from '../src/supervisor.mjs';
 import { stopTree } from '../src/claude.mjs';
 
 const exec = promisify(execFile);
@@ -141,38 +142,41 @@ test('summary parser and patch splitter handle renames, tabs and lines resemblin
   assert.deepEqual(splitPatch(''), []);
 });
 
-test('attempt records both snapshots and serves the diff of the turn after the files move on', async () => {
+test('a run keeps the snapshots and serves its diff after the files move on', async () => {
   await fixture(async ({ repo, snapshots }) => {
     await writeFile(join(repo, 'code.txt'), 'old\n'); await git(repo, 'add', '.'); await commit(repo);
     await writeFile(join(repo, 'user.txt'), 'user change\n');
-    let state = { projects: [{ id: 'project', path: repo, checks: [] }], tasks: [{ id: 'task', projectId: 'project', profile: 'subscription', title: 't', description: 'd', criteria: 'c', workflow: { mode: 'quick', checkIds: [] } }], profiles: {}, attempts: [] };
-    const script = `require('fs').writeFileSync('code.txt', 'new\\n'); process.stdout.write(${JSON.stringify(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done' }) + '\n')})`;
-    const manager = createAttempts({ getState: () => state, snapshots,
-      mutate: async fn => { const next = structuredClone(state); fn(next); state = next; },
+    const state = { projects: [{ id: 'project', path: repo, checks: [] }], tasks: [{ id: 'task', projectId: 'project', title: 't', description: 'd' }], settings: defaultSettings() };
+    const action = fields => ({ reason: 'r', workers: [], check_ids: [], question: null, summary: null, outcome: null, ...fields });
+    const decisions = [action({ action: 'run_workers', workers: [{ name: 'W', agent: 'claude-subscription', access: 'write', prompt: 'p', continue_worker: null }] }), action({ action: 'get_diff' }), action({ action: 'finish', outcome: 'done', summary: 'ok' })];
+    const line = extra => JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', ...extra }) + '\n';
+    const prompts = [];
+    const manager = createRuns({ getState: () => state, snapshots, store: { save: async () => {} },
       environmentFor: async () => ({ environment: { ...process.env }, secrets: [] }),
-      launch: ({ cwd, environment }) => { const child = spawn(process.execPath, ['-e', script], { cwd, env: environment, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }); child.stdin.on('error', () => {}); child.stdin.end(); return child; },
-      stop: stopTree });
-    const preview = await manager.prepare('task');
-    assert.equal(preview.autoStart, false);
-    await manager.start('task', preview.previewId, true);
-    let attempt;
-    for (let i = 0; i < 500 && !(attempt = manager.list('task').at(-1))?.attribution; i++) await delay(20);
-    assert.ok(attempt.attribution, 'attempt finished');
-    assert.ok(attempt.baseline.snapshot.tree); assert.ok(attempt.after.snapshot.tree);
-    assert.match(attempt.attribution, /разницу двух снимков/);
+      launch: ({ cwd, environment, supervisor, prompt }) => {
+        if (supervisor) prompts.push(prompt);
+        const script = supervisor ? `process.stdout.write(${JSON.stringify(line({ structured_output: decisions.shift() }))})` : `require('fs').writeFileSync('code.txt', 'new\\n'); process.stdout.write(${JSON.stringify(line())})`;
+        const child = spawn(process.execPath, ['-e', script], { cwd, env: environment, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }); child.stdin.on('error', () => {}); child.stdin.end(); return child;
+      }, stop: stopTree });
+    await manager.start('task');
+    let run;
+    for (let i = 0; i < 500 && (run = manager.get('task')).status !== 'готово'; i++) await delay(20);
+    assert.equal(run.status, 'готово', run.error);
+    assert.ok(run.baseline.snapshot.tree); assert.ok(run.current.snapshot.tree);
+    assert.deepEqual(run.workers[0].changedPaths, ['code.txt'], 'the worker is not credited with the user\'s earlier change');
+    assert.match(prompts[2], /\+new/, 'the supervisor saw the diff it asked for');
+    assert.doesNotMatch(prompts[2], /user change/, 'user changes from before the run are not part of it');
 
     await writeFile(join(repo, 'code.txt'), 'edited later\n');
-    const diff = await manager.diff('task', attempt.id, 'attempt');
+    const diff = await manager.diff('task', 'run');
     assert.equal(diff.available, true); assert.deepEqual(diff.files.map(file => file.path), ['code.txt']);
     assert.match(diff.files[0].patch, /\+new/); assert.doesNotMatch(diff.files[0].patch, /edited later/);
-    const initial = await manager.diff('task', attempt.id, 'initial');
+    const worker = await manager.diff('task', 'worker', 'w1');
+    assert.deepEqual(worker.files.map(file => file.path), ['code.txt']);
+    const initial = await manager.diff('task', 'initial');
     assert.deepEqual(initial.files.map(file => file.path), ['user.txt']);
-    await assert.rejects(manager.diff('task', attempt.id, 'other'), /область/);
-
+    await assert.rejects(manager.diff('task', 'other'), /область/);
+    await assert.rejects(manager.diff('task', 'worker', 'w9'), /не найден/);
     await manager.shutdown();
-    // Saved attempts from before snapshots existed report that, rather than an empty diff.
-    delete state.attempts[0].baseline.snapshot;
-    const restarted = createAttempts({ getState: () => state, snapshots, mutate: async () => {}, environmentFor: async () => ({}) });
-    assert.match((await restarted.diff('task', attempt.id, 'attempt')).reason, /до их появления/);
   });
 });

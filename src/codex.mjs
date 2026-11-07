@@ -1,8 +1,10 @@
 import { spawn } from 'node:child_process';
 import { validSessionId } from './claude.mjs';
 
-export function codexArgs({ model = '', resumeSessionId, schemaPath, readOnly = false } = {}) {
+export function codexArgs({ model = '', resumeSessionId, schemaPath, readOnly = false, images = [] } = {}) {
   if (resumeSessionId !== undefined && !validSessionId(resumeSessionId)) throw new Error('Invalid session ID');
+  // The CLI splits this flag's value at commas, so such a path would silently name different files.
+  if (images.some(image => image.path.includes(','))) throw new Error('Image path contains a comma');
   const args = ['-a', 'never', 'exec', '--sandbox', readOnly ? 'read-only' : 'workspace-write'];
   if (resumeSessionId) args.push('resume', resumeSessionId);
   args.push('--json');
@@ -10,6 +12,8 @@ export function codexArgs({ model = '', resumeSessionId, schemaPath, readOnly = 
   if (model) args.push('--model', model);
   if (schemaPath) args.push('--output-schema', schemaPath);
   if (readOnly) args.push('--ephemeral');
+  // In one argument: the flag takes several values and would otherwise swallow the final «-».
+  for (const image of images) args.push(`--image=${image.path}`);
   args.push('-');
   return args;
 }
@@ -21,7 +25,7 @@ export function launchCodex({ cwd, environment, prompt, ...options }) {
 }
 
 export function codexStream(onOutput) {
-  let pending = '', invalid = false, failed = false, completed = 0, sessionId, finalText = '';
+  let pending = '', invalid = false, failed = false, completed = 0, sessionId, finalText = '', errorText = '', usage = null;
   function line(value) {
     if (!value.trim()) return;
     let event;
@@ -31,8 +35,12 @@ export function codexStream(onOutput) {
       if (!validSessionId(event.thread_id) || (sessionId && sessionId !== event.thread_id)) invalid = true;
       else sessionId = event.thread_id;
     }
-    if (event.type === 'error' || event.type === 'turn.failed') failed = true;
-    if (event.type === 'turn.completed') completed++;
+    if (event.type === 'error' || event.type === 'turn.failed') {
+      failed = true;
+      const message = event.message ?? event.error?.message;
+      if (typeof message === 'string') errorText = message.slice(0, 2000);
+    }
+    if (event.type === 'turn.completed') { completed++; usage = event.usage; }
     if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
       if (typeof event.item.text !== 'string' || event.item.text.length > 256 * 1024) invalid = true;
       else { finalText = event.item.text; onOutput(finalText + '\n'); }
@@ -54,6 +62,13 @@ export function codexStream(onOutput) {
       return code === 0 && !invalid && !failed && completed === 1 && sessionId && finalText.trim() ? 'выполнение завершено' : 'ошибка';
     },
     sessionId() { return !invalid && !failed ? sessionId : undefined; },
-    finalText() { return finalText; }
+    finalText() { return finalText; },
+    errorText() { return errorText; },
+    // Input includes the cached part. Codex names neither the model nor a price here.
+    usage() {
+      const count = value => Number.isFinite(value) && value >= 0 ? value : 0;
+      const input = count(usage?.input_tokens), cached = Math.min(count(usage?.cached_input_tokens), input), output = count(usage?.output_tokens);
+      return { models: input || output ? [{ model: '', input: input - cached, output, cacheRead: cached, cacheWrite: 0, costUsd: null }] : [], partial: false, limits: null };
+    }
   };
 }

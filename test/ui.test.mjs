@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -6,481 +6,395 @@ import { Window } from 'happy-dom';
 
 const html = await readFile(new URL('../src/index.html', import.meta.url), 'utf8');
 const code = await readFile(new URL('../src/app.js', import.meta.url), 'utf8');
-const project = { id: 'project', path: 'C:/Projects/example', checks: [{ id: 'tests', name: 'Tests', executable: 'node', args: ['--test'], timeoutSeconds: 30 }],
-  defaultPresetId: 'preset' };
-const preset = { id: 'preset', name: 'With tests', profile: 'subscription', instructions: 'Keep compatibility', workflow: { mode: 'checked' } };
-async function waitFor(predicate) {
-  for (let i = 0; i < 100; i++) { if (predicate()) return; await delay(10); }
+const agentOptions = [{ id: 'claude-subscription', label: 'Claude · подписка' }, { id: 'claude-litellm', label: 'Claude · LiteLLM' }, { id: 'claude-deepseek', label: 'Claude · DeepSeek' }, { id: 'codex', label: 'Codex' }];
+const project = { id: 'project', path: 'C:/Projects/example', checks: [] };
+const task = { id: 'task-1', projectId: 'project', title: 'Исправить add', description: 'Исправить add', status: 'выполнение', createdAt: new Date().toISOString() };
+const baseRun = {
+  taskId: 'task-1', status: 'выполнение', phase: 'Работает: Исполнитель', active: true, queued: false, supervisor: { label: 'Claude · подписка', model: '' }, counters: { turns: 2, workerStarts: 1 }, costUsd: 0.0123, grants: [], baseline: { clean: true, snapshot: { tree: 'a' } }, current: { snapshot: { tree: 'b' } }, checkRuns: [], report: null, waiting: null,
+  journal: [{ kind: 'user', text: 'Исправить add' }, { kind: 'decision', action: 'run_workers', reason: 'Простая правка: хватит одного воркера' }],
+  workers: [{ id: 'w1', name: 'Исполнитель', rosterId: 'claude-subscription', access: 'write', status: 'выполняется', prompt: 'Исправь add()', output: 'журнал <img src=x onerror=alert(1)>', answer: '', diagnostics: { output: '' }, model: '' }]
+};
+const opened = [];
+afterEach(async () => { for (const window of opened.splice(0)) await window.happyDOM.close(); });
+async function waitFor(predicate, attempts = 200) {
+  for (let i = 0; i < attempts; i++) { if (predicate()) return; await delay(10); }
   assert.fail('UI did not reach expected state');
 }
-async function page(initial = {}) {
+async function page(initial = {}, run = null) {
   const window = new Window({ url: 'http://127.0.0.1:3217', settings: { disableCSSFileLoading: true, disableJavaScriptFileLoading: true } });
+  opened.push(window);
   const document = window.document;
   document.write(html.replace(/<script[^>]*>.*?<\/script>/gs, ''));
-  const state = { token: 'test-token', projects: [structuredClone(project)], presets: [structuredClone(preset)], tasks: [], profiles: { variables: [] }, profileTemplate: { variables: [] }, deepTemplate: {}, ...initial };
-  const calls = [];
-  let attempts = [];
+  const state = { token: 'test-token', projects: [structuredClone(project)], tasks: [], agentOptions, settings: { supervisor: { id: 'claude-subscription', model: '' }, workers: [{ id: 'claude-subscription', model: '', note: '' }, { id: 'codex', model: '', note: 'для ревью' }] }, profiles: { variables: [] }, profileTemplate: { variables: [] }, deepTemplate: {}, ...initial };
+  const calls = [], context = { run };
   window.fetch = async (url, options = {}) => {
     const input = options.body ? JSON.parse(options.body) : undefined;
     calls.push({ url, input });
     let body;
     if (url === '/api/state') body = structuredClone(state);
-    else if (url === '/api/tasks') {
-      const chosen = state.presets.find(p => p.id === input.presetId);
-      body = { id: 'task-1', ...input, title: input.title || input.description, criteria: input.criteria || 'Requirement', status: 'создана', createdAt: new Date().toISOString(), ...(chosen ? { profile: chosen.profile, workflow: { ...chosen.workflow, checkIds: ['tests'] }, preset: structuredClone(chosen) } : {}) };
-      state.tasks.push(body);
-    } else if (url === '/api/attempts') body = attempts;
-    else if (url === '/api/attempt-hold') { attempts.at(-1).automation.stopAfterPass = true; body = { stopAfterPass: true }; }
-    else if (url === '/api/attempt-prepare') body = { previewId: 'preview', workspace: { path: project.path, branch: 'main', head: 'abc', clean: true, changes: [] }, workflow: state.tasks[0].workflow, checks: [], review: 'не запрошено', profile: 'subscription', command: ['claude', '--print'], message: input.message, autoStart: !!state.autoStart };
-    else if (url === '/api/attempt-start') body = { id: 'attempt-2' };
-    else if (url === '/api/attempt-decide') body = { id: input.attemptId };
-    else if (url === '/api/checks-refresh') body = { checks: 'пройдены', fingerprintMatches: true };
-    else if (url === '/api/attempt-diff') body = state.diffs[input.scope];
-    else if (url === '/api/task-delete') { state.tasks = state.tasks.filter(t => t.id !== input.taskId); body = { removedTasks: 1 }; }
-    else if (url === '/api/preset-delete') { state.presets = []; body = { removedTasks: 0 }; }
-    else if (url === '/api/project-default') { state.projects[0].defaultPresetId = input.presetId; body = structuredClone(state.projects[0]); }
-    else if (url === '/api/project-preset-checks') {
-      const target = state.projects[0];
-      if (Array.isArray(input.checkIds) && !input.checkIds.length) return { ok: false, json: async () => ({ error: 'Выберите хотя бы одну проверку' }) };
-      target.presetChecks ??= {};
-      if (input.checkIds === null) delete target.presetChecks[input.presetId]; else target.presetChecks[input.presetId] = input.checkIds;
-      body = structuredClone(target);
-    }
-    else if (url === '/api/project-delete') { state.projects = []; state.tasks = []; body = { removedTasks: 1 }; }
-    else if (url === '/api/preset') { body = { ...input.preset, id: 'new-preset' }; state.presets.push(body); }
-    else throw new Error(`Unexpected endpoint ${url}`);
-    return { ok: true, json: async () => structuredClone(body) };
+    else if (url === '/api/tasks') { body = { ...task, description: input.description, status: 'в очереди' }; state.tasks.push(body); }
+    else if (url === '/api/run') body = context.run;
+    else if (url === '/api/run-message') { context.run = context.run && { ...context.run, active: true, waiting: null, journal: [...context.run.journal, { kind: 'user', text: input.message }] }; body = context.run ?? {}; }
+    else if (url === '/api/run-start') { context.run = structuredClone(baseRun); body = context.run; }
+    else if (url === '/api/run-stop') body = { status: 'остановка' };
+    else if (url === '/api/run-diff') body = { scope: input.scope, available: true, files: [{ status: 'M', path: 'add.mjs', additions: 1, deletions: 1, patch: 'diff --git a/add.mjs b/add.mjs\n@@ -1 +1 @@\n-a\n+b\n' }] };
+    else if (url === '/api/usage') body = context.usage ?? { totals: { runs: 0 }, agents: [], models: [], roles: [], tasks: [], limits: [], firstAt: null };
+    else if (url === '/api/run-worker') body = { output: 'полный журнал' };
+    else if (url === '/api/settings') { state.settings = input; body = input; }
+    else if (url === '/api/task-delete') { state.tasks = state.tasks.filter(item => item.id !== input.taskId); body = { removedTasks: 1 }; }
+    else body = { ok: true };
+    return { ok: true, status: 200, json: async () => structuredClone(body) };
   };
   window.eval(code);
-  await waitFor(() => document.querySelector('#task select[name=projectId]').options.length > 0 || !state.projects.length);
-  await delay(20);
-  return { window, document, calls, state, setAttempts(value) { attempts = value; }, async close() { await window.happyDOM.close(); } };
+  await waitFor(() => document.querySelector('#task select[name=projectId]').options.length === state.projects.length && calls.some(call => call.url === '/api/state') && !!document.querySelector('#composer-note').textContent);
+  return { window, document, calls, state, context };
 }
+const open = async (view, id = 'task-1') => { view.window.location.hash = `#task/${id}`; await waitFor(() => view.document.querySelector('.task-detail')); };
 
-test('composer applies project preset, creates a task from one prompt and opens its launch preview', async () => {
-  const p = await page();
-  try {
-    const form = p.document.querySelector('#task');
-    assert.equal(form.elements.presetId.value, 'preset');
-    assert.equal(form.elements.workflowMode.value, 'checked');
-    assert.equal(form.elements.profile.disabled, true);
-    form.elements.description.value = 'Fix reconnect';
-    form.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-    await waitFor(() => p.document.querySelector('.launch-preview button')).catch(error => { throw new Error(p.document.querySelector('#message').textContent + ' | ' + JSON.stringify(p.calls), { cause: error }); });
-    assert.equal(p.calls.find(c => c.url === '/api/tasks').input.presetId, 'preset');
-    assert.equal(p.document.querySelector('[data-page=task]').hidden, false);
-    assert.match(p.document.querySelector('.task-detail h1').textContent, /Fix reconnect/);
-    assert.equal(p.calls.filter(c => c.url === '/api/attempt-prepare').length, 1);
-    assert.equal(p.calls.some(c => c.url === '/api/attempt-start'), false, 'Creating a task must not silently execute the agent');
-    p.window.location.hash = 'dashboard';
-    await waitFor(() => !p.document.querySelector('[data-page=dashboard]').hidden);
-    assert.equal(p.document.querySelectorAll('.task-row').length, 1);
-    const search = p.document.querySelector('#task-search'); search.value = 'missing'; search.dispatchEvent(new p.window.Event('input'));
-    assert.equal(p.document.querySelectorAll('.task-row').length, 0);
-  } finally { await p.close(); }
+test('a task needs only a description: no mode, process or agent to choose', async () => {
+  const view = await page();
+  const { document, calls } = view;
+  assert.equal(document.querySelector('[data-page=workflows]'), null);
+  assert.equal(document.querySelector('[data-nav=workflows]'), null);
+  assert.deepEqual([...document.querySelector('#task').elements].map(field => field.name).filter(Boolean).sort(), ['description', 'projectId']);
+  const form = document.querySelector('#task');
+  form.elements.description.value = 'Исправить add';
+  form.dispatchEvent(new view.window.Event('submit', { cancelable: true, bubbles: true }));
+  await waitFor(() => calls.some(call => call.url === '/api/tasks'));
+  assert.deepEqual(calls.find(call => call.url === '/api/tasks').input, { description: 'Исправить add', projectId: 'project' });
+  await waitFor(() => view.window.location.hash === '#task/task-1');
+  assert.equal(calls.filter(call => call.url.includes('prepare')).length, 0, 'nothing to confirm');
 });
 
-test('process editor is global: it saves instructions and stages without a project or checks', async () => {
-  const p = await page();
-  try {
-    p.window.location.hash = 'workflows';
-    await waitFor(() => !p.document.querySelector('[data-page=workflows]').hidden);
-    assert.equal(p.document.querySelector('#preset-project'), null);
-    assert.match(p.document.querySelector('#preset-list').textContent, /по умолчанию: example/);
-    const form = p.document.querySelector('#preset-form');
-    assert.equal(form.querySelector('input[name=checkIds]'), null);
-    form.elements.name.value = 'Fast compilation'; form.elements.instructions.value = 'Preserve public API'; form.elements.mode.value = 'checked';
-    form.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-    await waitFor(() => p.calls.some(c => c.url === '/api/preset'));
-    const payload = p.calls.find(c => c.url === '/api/preset').input;
-    assert.deepEqual(payload.preset.workflow, { mode: 'checked' });
-    assert.equal(payload.projectId, undefined);
-    assert.equal(payload.preset.instructions, 'Preserve public API');
-    assert.equal(p.state.tasks.length, 0);
-  } finally { await p.close(); }
+test('the task page shows who works, why and the current step, and agent text stays text', async () => {
+  const view = await page({ tasks: [task] }, baseRun);
+  await open(view);
+  const { document } = view;
+  await waitFor(() => document.querySelector('.decision'));
+  assert.match(document.querySelector('.phase').textContent, /Работает: Исполнитель/);
+  assert.match(document.querySelector('.workflow-route').textContent, /Супервизор: Claude · подписка/);
+  assert.match(document.querySelector('.decision').textContent, /Простая правка/);
+  assert.match(document.querySelector('.task-stats').textContent, /расчётная стоимость: \$0\.012/);
+  assert.equal(document.querySelector('[data-node=w1]').classList.contains('selected'), true, 'the running step is the one shown');
+  assert.match(document.querySelector('.inspector').textContent, /Исправь add\(\)/);
+  assert.equal(document.querySelector('.task-work img'), null, 'output is never parsed as HTML');
+  assert.match(document.querySelector('[data-worker=w1]').textContent, /<img src=x/);
+  assert.equal(document.querySelector('.run-controls .danger:not(.secondary)').hidden, false, 'stop is available');
 });
 
-test('every project offers every process and chooses its default and checks in place', async () => {
-  const other = { id: 'other', path: 'C:/Projects/other', checks: [{ id: 'gradle', name: 'Gradle', executable: 'gradle', args: ['test'], timeoutSeconds: 30 }, { id: 'lint', name: 'Lint', executable: 'gradle', args: ['lint'], timeoutSeconds: 30 }], presetChecks: { preset: ['gradle'] } };
-  const p = await page({ projects: [structuredClone(project), other] });
-  try {
-    const composer = p.document.querySelector('#task');
-    composer.elements.projectId.value = 'other'; composer.elements.projectId.dispatchEvent(new p.window.Event('change'));
-    assert.deepEqual(Array.from(composer.elements.presetId.options).map(o => o.value), ['', 'preset']);
-    assert.equal(composer.elements.presetId.value, '', 'the default of another project is not applied');
-    composer.elements.presetId.value = 'preset'; composer.elements.presetId.dispatchEvent(new p.window.Event('change'));
-    assert.deepEqual(Array.from(composer.querySelectorAll('#task-check-options input')).filter(i => i.checked).map(i => i.value), ['gradle']);
-
-    composer.elements.projectId.value = 'project'; composer.elements.projectId.dispatchEvent(new p.window.Event('change'));
-    const section = p.document.querySelectorAll('.project-processes')[0];
-    section.open = true;
-    const group = () => section.querySelector('[data-preset-checks=preset]');
-    assert.equal(group().querySelector('[data-all]').checked, true);
-    assert.equal(group().querySelector('input[value=tests]').disabled, true);
-
-    const all = group().querySelector('[data-all]'); all.checked = false; all.dispatchEvent(new p.window.Event('change'));
-    await waitFor(() => p.calls.some(c => c.url === '/api/project-preset-checks'));
-    assert.deepEqual(p.calls.find(c => c.url === '/api/project-preset-checks').input, { projectId: 'project', presetId: 'preset', checkIds: ['tests'] });
-    await waitFor(() => group().querySelector('[data-all]').checked === false);
-    assert.equal(section.open, true, 'saving does not collapse the section');
-
-    const box = group().querySelector('input[value=tests]'); box.checked = false; box.dispatchEvent(new p.window.Event('change'));
-    await waitFor(() => /хотя бы одну/.test(section.textContent));
-    assert.equal(group().querySelector('input[value=tests]').checked, true, 'a refused change is not shown as saved');
-
-    const defaultSelect = section.querySelector('select'); defaultSelect.value = ''; defaultSelect.dispatchEvent(new p.window.Event('change'));
-    await waitFor(() => p.calls.some(c => c.url === '/api/project-default'));
-    assert.deepEqual(p.calls.find(c => c.url === '/api/project-default').input, { projectId: 'project', presetId: '' });
-    await waitFor(() => composer.elements.presetId.value === '');
-  } finally { await p.close(); }
+test('a message can be sent while work is running', async () => {
+  const view = await page({ tasks: [task] }, baseRun);
+  await open(view);
+  const { document, calls } = view;
+  await waitFor(() => !document.querySelector('.reply').hidden);
+  assert.match(document.querySelector('.reply').textContent, /прочитает сообщение/);
+  document.querySelector('.reply textarea').value = 'Учти совместимость';
+  document.querySelector('.reply').dispatchEvent(new view.window.Event('submit', { cancelable: true, bubbles: true }));
+  await waitFor(() => calls.some(call => call.url === '/api/run-message'));
+  assert.deepEqual(calls.find(call => call.url === '/api/run-message').input, { taskId: 'task-1', message: 'Учти совместимость' });
 });
 
-test('diff is loaded on demand, shown as inert text and separated from changes that existed before the run', async () => {
-  const task = { id: 'task-1', projectId: 'project', profile: 'subscription', title: 'Diff', description: 'Fix it', criteria: 'Fixed', workflow: { mode: 'quick', checkIds: [] }, createdAt: new Date().toISOString(), status: 'выполнение завершено' };
-  const patch = 'diff --git a/a.html b/a.html\n--- a/a.html\n+++ b/a.html\n@@ -1 +1 @@\n-<b>old</b>\n+<img src=x onerror=alert(1)>\n';
-  const p = await page({ tasks: [task], diffs: {
-    attempt: { scope: 'attempt', available: true, truncated: false, patchLimit: 4194304, files: [{ status: 'M', path: 'a.html', additions: 1, deletions: 1, binary: false, patch }] },
-    initial: { scope: 'initial', available: false, reason: 'Снимок повреждён.' } } });
-  try {
-    p.setAttempts([{ id: 'attempt-1', taskId: task.id, status: task.status, profile: 'subscription', directory: project.path, events: [], output: 'done', checks: 'не запрошены', review: 'не запрошено', workflow: task.workflow, startedAt: new Date().toISOString(), endedAt: new Date().toISOString(),
-      baseline: { clean: false, snapshot: { tree: 'a'.repeat(40), head: null } }, after: { snapshot: { tree: 'b'.repeat(40), head: null } } }]);
-    p.window.location.hash = 'task/task-1';
-    await waitFor(() => p.document.querySelector('[data-diff=attempt]'));
-    assert.equal(p.calls.some(c => c.url === '/api/attempt-diff'), false, 'closed panel requests nothing');
-
-    const panel = p.document.querySelector('[data-diff=attempt]'); panel.open = true;
-    panel.dispatchEvent(new p.window.Event('toggle'));
-    await waitFor(() => panel.querySelector('.diff'));
-    assert.deepEqual(p.calls.find(c => c.url === '/api/attempt-diff').input, { taskId: 'task-1', attemptId: 'attempt-1', scope: 'attempt' });
-    assert.match(panel.textContent, /Файлов: 1, \+1 −1/);
-    assert.equal(panel.querySelector('.diff-add').textContent, '+<img src=x onerror=alert(1)>\n');
-    assert.equal(panel.querySelector('.diff-del').textContent, '-<b>old</b>\n');
-    assert.equal(panel.querySelector('img'), null, 'patch content is never parsed as HTML');
-
-    const initial = p.document.querySelector('[data-diff=initial]'); initial.open = true;
-    initial.dispatchEvent(new p.window.Event('toggle'));
-    await waitFor(() => /Diff недоступен/.test(initial.textContent));
-    assert.match(initial.textContent, /не результат агента/); assert.match(initial.textContent, /Снимок повреждён/);
-  } finally { await p.close(); }
+test('a question comes with its answer box at the top of the task, and the answer goes back', async () => {
+  const run = { ...baseRun, active: false, status: 'ждёт ответа', phase: '', waiting: { question: 'Какой API оставить?' } };
+  const view = await page({ tasks: [{ ...task, status: 'ждёт ответа' }] }, run);
+  await open(view);
+  const { document, calls } = view;
+  await waitFor(() => document.querySelector('.task-head .question') && !document.querySelector('.task-head .question').hidden);
+  const form = document.querySelector('.task-head .question');
+  assert.equal(form.querySelector('.question-text').textContent, 'Какой API оставить?');
+  assert.equal(document.querySelector('.reply').hidden, true, 'there is one place to answer');
+  assert.equal(document.activeElement, form.querySelector('textarea'), 'the cursor is ready');
+  form.querySelector('textarea').value = 'Старый';
+  form.dispatchEvent(new view.window.Event('submit', { cancelable: true, bubbles: true }));
+  await waitFor(() => calls.some(call => call.url === '/api/run-message'));
+  assert.deepEqual(calls.find(call => call.url === '/api/run-message').input, { taskId: 'task-1', message: 'Старый' });
 });
 
-test('completed session exposes a follow-up composer and preserves its message in preview', async () => {
-  const task = { id: 'task-1', projectId: 'project', profile: 'subscription', title: 'Clarification', description: 'Fix it', criteria: 'Fixed', workflow: { mode: 'quick', checkIds: [] }, createdAt: new Date().toISOString(), status: 'выполнение завершено' };
-  const p = await page({ tasks: [task] });
-  try {
-    p.setAttempts([{ id: 'attempt-1', taskId: task.id, sessionId: 'e4a4d998-3c62-4c1f-bd0e-56661f1471ff', status: task.status, profile: 'subscription', directory: project.path, events: [], output: 'Which handler?', checks: 'не запрошены', review: 'не запрошено', workflow: task.workflow, startedAt: new Date().toISOString(), endedAt: new Date().toISOString() }]);
-    p.window.location.hash = 'task/task-1';
-    await waitFor(() => p.document.querySelector('.reply') && !p.document.querySelector('.reply').hidden);
-    const reply = p.document.querySelector('.reply'); reply.querySelector('textarea').value = 'The reconnect handler';
-    reply.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-    await waitFor(() => p.document.querySelector('.launch-preview button'));
-    assert.equal(p.calls.find(c => c.url === '/api/attempt-prepare').input.message, 'The reconnect handler');
-    assert.match(p.document.querySelector('.launch-preview').textContent, /The reconnect handler/);
-    assert.equal(p.document.querySelector('[data-task-status]').textContent, 'Ответ получен');
-  } finally { await p.close(); }
+test('a question sits in its task card, can be answered there and survives a refresh of other tasks', async () => {
+  const view = await page({ tasks: [{ ...task, status: 'ждёт ответа', question: 'Закрыть Unity?' }, { ...task, id: 'task-2', status: 'выполнение', latest: { kind: 'decision', text: 'Было', now: '' } }] });
+  const { document, calls, state, window } = view;
+  await waitFor(() => document.querySelector('.task-row-wrap .question'));
+  assert.equal(document.querySelector('#dashboard-questions'), null, 'no separate block above the tasks');
+  const card = document.querySelector('.task-row-wrap.has-question'), form = card.querySelector('.question');
+  assert.match(form.textContent, /Закрыть Unity\?/); assert.equal(card.querySelector('a').getAttribute('href'), '#task/task-1');
+  assert.equal(form.closest('a'), null, 'typing an answer does not sit inside the link');
+  assert.equal(document.querySelector('#nav-questions').textContent, '1'); assert.equal(document.querySelector('#nav-questions').hidden, false);
+  assert.match(document.title, /^\(1\) Есть вопрос/);
+  const input = form.querySelector('textarea'); input.value = 'Да, закрой'; input.focus();
+  state.tasks[1].latest.text = 'Стало';
+  await waitFor(() => /Стало/.test(document.querySelector('#dashboard-tasks').textContent), 500); // The dashboard refreshes every 2.5 s.
+  assert.equal(form.isConnected, true); assert.equal(input.value, 'Да, закрой'); assert.equal(document.activeElement, input);
+  form.dispatchEvent(new window.Event('submit', { cancelable: true, bubbles: true }));
+  await waitFor(() => calls.some(call => call.url === '/api/run-message'));
+  assert.deepEqual(calls.find(call => call.url === '/api/run-message').input, { taskId: 'task-1', message: 'Да, закрой' });
+  delete state.tasks[0].question;
+  await waitFor(() => !document.querySelector('.task-row-wrap .question'));
+  assert.equal(document.querySelector('#nav-questions').hidden, true);
+  assert.doesNotMatch(document.title, /вопрос/);
 });
 
-test('tasks, processes and projects are deleted only on a second click', async () => {
-  const task = { id: 'task-1', projectId: 'project', profile: 'subscription', title: 'Old', description: 'Old', criteria: 'Old', workflow: { mode: 'quick', checkIds: [] }, createdAt: new Date().toISOString(), status: 'выполнение завершено' };
-  const p = await page({ tasks: [task] });
-  const count = url => p.calls.filter(c => c.url === url).length;
-  try {
-    const removeTask = p.document.querySelector('.task-row-wrap button');
-    removeTask.click();
-    assert.equal(count('/api/task-delete'), 0); assert.equal(removeTask.textContent, 'Точно?');
-    removeTask.click();
-    await waitFor(() => !p.document.querySelector('.task-row-wrap'));
-    assert.equal(p.calls.find(c => c.url === '/api/task-delete').input.taskId, 'task-1');
-    const removePreset = p.document.querySelector('#preset-list .danger');
-    removePreset.click(); assert.equal(count('/api/preset-delete'), 0); removePreset.click();
-    await waitFor(() => !p.document.querySelector('#preset-list .danger'));
-    assert.deepEqual(p.calls.find(c => c.url === '/api/preset-delete').input, { presetId: 'preset' });
-    const removeProject = p.document.querySelector('.project-list .danger');
-    removeProject.click(); assert.equal(count('/api/project-delete'), 0); removeProject.click();
-    await waitFor(() => !p.document.querySelector('.project-list .danger'));
-    assert.equal(p.calls.find(c => c.url === '/api/project-delete').input.projectId, 'project');
-  } finally { await p.close(); }
+test('a card shows the latest message from the agents, as text', async () => {
+  const view = await page({ tasks: [{ ...task, status: 'выполнение', latest: { kind: 'decision', text: 'Нужно ревью <img src=x>', now: 'Работает: Ревью' } }, { ...task, id: 'task-2', status: 'готово', latest: { kind: 'report', text: 'Нормали исправлены' } }] });
+  const { document } = view;
+  await waitFor(() => document.querySelectorAll('.task-latest').length === 2);
+  const text = document.querySelector('#dashboard-tasks').textContent;
+  assert.match(text, /Супервизор: Нужно ревью <img src=x>/); assert.match(text, /Сейчас: Работает: Ревью/); assert.match(text, /Отчёт: Нормали исправлены/);
+  assert.equal(document.querySelector('#dashboard-tasks img'), null);
 });
 
-test('a checkout without user changes starts at once, with no launch preview', async () => {
-  const p = await page({ autoStart: true });
-  try {
-    const form = p.document.querySelector('#task');
-    form.elements.description.value = 'Fix reconnect';
-    form.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-    await waitFor(() => p.calls.some(c => c.url === '/api/attempt-start'));
-    assert.equal(p.document.querySelector('.launch-preview').children.length, 0);
-  } finally { await p.close(); }
+test('a new task is written in a window that opens from the toolbar and keeps the draft', async () => {
+  const view = await page();
+  const { document, window } = view, composer = document.querySelector('#composer');
+  assert.equal(composer.open, false);
+  document.querySelector('#new-task').click();
+  assert.equal(composer.open, true);
+  document.querySelector('#task-description').value = 'Черновик';
+  document.querySelector('#composer-cancel').click();
+  assert.equal(composer.open, false);
+  assert.equal(document.querySelector('#task-description').value, 'Черновик');
+  document.dispatchEvent(new window.KeyboardEvent('keydown', { code: 'KeyN', bubbles: true }));
+  assert.equal(composer.open, true, 'N opens it');
+  document.querySelector('#task').dispatchEvent(new window.Event('submit', { cancelable: true, bubbles: true }));
+  await waitFor(() => window.location.hash === '#task/task-1');
+  assert.equal(composer.open, false, 'it closes once the task exists');
 });
 
-test('opening a task compares results with current files without a button', async () => {
-  const task = { id: 'task-1', projectId: 'project', profile: 'subscription', title: 'Fresh', description: 'Fix it', criteria: 'Fixed', workflow: { mode: 'checked', checkIds: ['tests'] }, createdAt: new Date().toISOString(), status: 'проверки завершены' };
-  const p = await page({ tasks: [task] });
-  try {
-    p.setAttempts([{ id: 'attempt-1', taskId: task.id, sessionId: 'e4a4d998-3c62-4c1f-bd0e-56661f1471ff', status: task.status, profile: 'subscription', directory: project.path, events: [], output: '', checks: 'пройдены', review: 'не запрошено', workflow: task.workflow, startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), after: { fingerprint: 's' },
-      checkRuns: [{ cycle: 0, status: 'пройдены', validity: 'совпадает', snapshot: 's', results: [] }] }]);
-    p.window.location.hash = 'task/task-1';
-    await waitFor(() => p.calls.some(c => c.url === '/api/checks-refresh'));
-    assert.equal(p.calls.find(c => c.url === '/api/checks-refresh').input.attemptId, 'attempt-1');
-    await waitFor(() => p.document.querySelector('[data-attempt]'));
-    assert.doesNotMatch(p.document.querySelector('.task-detail').textContent, /Проверить актуальность/);
-  } finally { await p.close(); }
+test('the graph puts the newest step on top, parallel workers side by side, and the next step is not invented', async () => {
+  const done = (id, name) => ({ ...baseRun.workers[0], id, name, access: 'read', status: 'готово', answer: `Ответ ${name}`, startedAt: '2026-11-04T10:00:00Z', endedAt: '2026-11-04T10:00:54Z' });
+  const run = { ...baseRun, phase: 'Работает: Третий', checkRuns: [{ id: 'c1', status: 'пройдены', results: [{ definition: { id: 't', name: 'Тесты' }, status: 'пройдена', exitCode: 0, output: '' }] }],
+    journal: [{ kind: 'user', text: 'Задача' }, { kind: 'decision', action: 'run_workers', reason: 'Сначала два чтения' }, { kind: 'workers', ids: ['w1', 'w2'] }, { kind: 'decision', action: 'run_checks', reason: 'Прогнать тесты' }, { kind: 'checks', id: 'c1' }, { kind: 'decision', action: 'ask_user', reason: 'Нужен ответ' }, { kind: 'answer', question: 'Закрыть?', text: 'можно' }, { kind: 'decision', action: 'run_workers', reason: 'Теперь правка' }],
+    workers: [done('w1', 'Первый'), done('w2', 'Второй'), { ...baseRun.workers[0], id: 'w3', name: 'Третий', startedAt: new Date().toISOString() }] };
+  const view = await page({ tasks: [task] }, run);
+  await open(view);
+  const { document } = view;
+  await waitFor(() => document.querySelector('[data-node=w3]'));
+  const rows = [...document.querySelectorAll('.graph-row')].map(row => [...row.children].map(node => node.dataset.node));
+  assert.deepEqual(rows, [['next'], ['w3'], ['j5'], ['c1'], ['w1', 'w2'], ['task']]);
+  assert.equal(document.querySelector('[data-node=next]').classList.contains('tone-ghost'), true);
+  assert.match(document.querySelector('[data-node=w1]').textContent, /54 с/);
+  assert.match(document.querySelector('[data-node=j5]').textContent, /→ можно/);
+  assert.notEqual(document.querySelector('.inspector [data-worker=w3]'), null, 'the running step is shown first');
+  document.querySelector('[data-node=w2]').click();
+  assert.match(document.querySelector('.inspector').textContent, /Сначала два чтения/);
+  assert.match(document.querySelector('.inspector').textContent, /Ответ Второй/);
+  assert.equal(document.querySelector('[data-node=w2]').getAttribute('aria-pressed'), 'true');
+  view.context.run = { ...run, phase: 'Супервизор выбирает следующий шаг', workers: [...run.workers.slice(0, 2), { ...run.workers[2], output: 'новый вывод' }] };
+  await waitFor(() => /супервизор выбирает/.test(document.querySelector('[data-node=next]').textContent));
+  assert.match(document.querySelector('.inspector').textContent, /Ответ Второй/, 'a chosen step stays chosen while work goes on');
 });
 
-test('denied actions show their exact rules and one click resumes the session', async () => {
-  const task = { id: 'task-1', projectId: 'project', profile: 'subscription', title: 'CI', description: 'Check CI', criteria: 'Known', workflow: { mode: 'quick', checkIds: [] }, createdAt: new Date().toISOString(), status: 'требуется решение' };
-  const p = await page({ tasks: [task] });
-  try {
-    p.setAttempts([{ id: 'attempt-1', taskId: task.id, sessionId: 'e4a4d998-3c62-4c1f-bd0e-56661f1471ff', status: task.status, profile: 'subscription', directory: project.path, events: [], output: '', checks: 'не запрошены', review: 'не запрошено', workflow: task.workflow, startedAt: new Date().toISOString(), endedAt: new Date().toISOString(),
-      permissionDenials: [{ tool: 'PowerShell', detail: 'glab mr view', rule: 'PowerShell(glab mr view)' }, { tool: 'Edit', detail: '{}', rule: null }] }]);
-    p.window.location.hash = 'task/task-1';
-    await waitFor(() => p.document.querySelector('[data-denials] button'));
-    const panel = p.document.querySelector('[data-denials]');
-    assert.match(panel.textContent, /Будет разрешено: PowerShell\(glab mr view\)/); assert.match(panel.textContent, /кнопка его не разрешит/);
-    panel.querySelector('button').click();
-    await waitFor(() => p.calls.some(c => c.url === '/api/attempt-start'));
-    assert.equal(p.calls.find(c => c.url === '/api/attempt-prepare' && c.input.allowDenied === true).input.taskId, 'task-1');
-  } finally { await p.close(); }
+test('the report separates the model text from facts, and failed checks are visible', async () => {
+  const run = { ...baseRun, active: false, status: 'требуется решение', statusReason: 'Супервизор завершил задачу, но последние проверки не пройдены.', phase: '',
+    report: { outcome: 'done', summary: 'Всё отлично', evidence: { filesChanged: true, checks: 'есть ошибки', readAfterWrite: false } },
+    checkRuns: [{ id: 'c1', status: 'есть ошибки', results: [{ definition: { id: 't', name: 'Тесты' }, status: 'ошибка', exitCode: 7, output: 'failed' }] }],
+    journal: [...baseRun.journal, { kind: 'checks', id: 'c1' }], workers: [{ ...baseRun.workers[0], status: 'готово', answer: 'Правка готова' }] };
+  const view = await page({ tasks: [{ ...task, status: 'требуется решение' }] }, run);
+  await open(view);
+  const { document } = view;
+  await waitFor(() => document.querySelector('.report'));
+  assert.match(document.querySelector('.phase').textContent, /не пройдены/);
+  const report = document.querySelector('.report').textContent;
+  assert.match(report, /Всё отлично/); assert.match(report, /Проверки: есть ошибки/); assert.match(report, /написан моделью/);
+  document.querySelector('[data-node=c1]').click();
+  await waitFor(() => document.querySelector('.inspector [data-check=c1]'));
+  assert.match(document.querySelector('[data-check=c1]').textContent, /код выхода 7/);
+  assert.equal(document.querySelector('[data-check=c1] details').open, true, 'a failed check is open');
+  assert.ok(document.querySelector('[data-diff=run]'), 'the whole diff is offered');
 });
 
-test('custom checked workflow sends explicit selections and an empty workspace cannot submit', async () => {
-  const p = await page();
-  try {
-    const form = p.document.querySelector('#task');
-    form.elements.presetId.value = ''; form.elements.presetId.dispatchEvent(new p.window.Event('change'));
-    form.elements.workflowMode.value = 'checked'; form.elements.workflowMode.dispatchEvent(new p.window.Event('change'));
-    form.elements.description.value = 'Run selected checks';
-    assert.equal(form.elements.profile.disabled, false);
-    form.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-    await waitFor(() => p.calls.some(c => c.url === '/api/tasks'));
-    const input = p.calls.find(c => c.url === '/api/tasks').input;
-    assert.deepEqual(input.workflow, { mode: 'checked', checkIds: ['tests'] });
-    assert.equal(input.presetId, undefined);
-  } finally { await p.close(); }
-  const empty = await page({ projects: [] });
-  try {
-    assert.equal(empty.document.querySelector('#create-task').disabled, true);
-    assert.match(empty.document.querySelector('.empty-state').textContent, /Подключить первый проект/);
-  } finally { await empty.close(); }
+test('the final report is the details of the last step, so the graph stays on the first screen', async () => {
+  const run = { ...baseRun, active: false, status: 'готово', statusReason: 'Завершено', phase: '', report: { outcome: 'done', summary: 'Итог работы', evidence: { filesChanged: true, checks: 'не запускались', readAfterWrite: false } },
+    journal: [...baseRun.journal, { kind: 'workers', ids: ['w1'] }, { kind: 'decision', action: 'finish', reason: 'Всё сделано' }], workers: [{ ...baseRun.workers[0], status: 'готово', answer: 'Правка готова' }] };
+  const view = await page({ tasks: [{ ...task, status: 'готово' }] }, run);
+  await open(view);
+  const { document } = view;
+  await waitFor(() => document.querySelector('.inspector .report'));
+  assert.match(document.querySelector('.inspector').textContent, /Всё сделано/);
+  assert.match(document.querySelector('.inspector .report').textContent, /Итог работы/);
+  assert.equal(document.querySelectorAll('.report').length, 1, 'one report on the page');
+  assert.notEqual(document.querySelector('.task-details [data-diff=run]'), null);
 });
 
-test('Codex roles and reviewer configuration can be edited and submitted in the UI', async () => {
-  const p = await page();
-  try {
-    const form = p.document.querySelector('#preset-form');
-    form.elements.name.value = 'Codex and review';
-    form.elements.agent.value = 'codex'; form.elements.agent.dispatchEvent(new p.window.Event('change'));
-    assert.equal(form.elements.profile.value, 'default'); assert.equal(form.elements.profile.options.length, 1);
-    form.elements.model.value = 'executor-model'; form.elements.mode.value = 'review'; form.elements.mode.dispatchEvent(new p.window.Event('change'));
-    assert.equal(form.querySelector('[data-review-options]').hidden, false);
-    form.elements.reviewModel.value = 'review-model'; form.elements.reviewInstructions.value = 'Check compatibility';
-    form.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-    await waitFor(() => p.calls.some(c => c.url === '/api/preset'));
-    const preset = p.calls.find(c => c.url === '/api/preset').input.preset;
-    assert.equal(preset.agent, 'codex'); assert.equal(preset.profile, 'default'); assert.equal(preset.model, 'executor-model');
-    assert.deepEqual(preset.workflow.reviewer, { agent: 'codex', profile: 'default', model: 'review-model', instructions: 'Check compatibility' });
-    assert.equal(preset.workflow.checkIds, undefined);
-    assert.equal(preset.workflow.fixer, undefined);
-  } finally { await p.close(); }
+test('text from models renders as Markdown, and nothing in it can become HTML or a script link', async () => {
+  const answer = '# Итог\n\n**Главный вывод:** `a|b` и *важно*, foo_bar_baz 2*3*4\n\n| Метрика | Значение |\n|---|---:|\n| Записей | 28 060 |\n| Код | `x\\|y` |\n\n- первый\n  - вложенный\n- второй\n\n1. раз\n2. два\n\n> цитата\n\n```\nconst a = "**не жирный**";\n```\n\n<img src=x onerror=alert(1)> [плохая](javascript:alert(1)) [хорошая](https://example.com/a) https://example.org/b.';
+  const run = { ...baseRun, active: false, status: 'готово', phase: '', workers: [{ ...baseRun.workers[0], status: 'готово', answer }] };
+  const view = await page({ tasks: [{ ...task, status: 'готово' }] }, run);
+  await open(view);
+  const { document } = view;
+  await waitFor(() => document.querySelector('[data-worker=w1] .markdown table'));
+  const block = [...document.querySelectorAll('[data-worker=w1] .markdown')].find(node => node.querySelector('table'));
+  assert.equal(block.querySelector('h3').textContent, 'Итог');
+  assert.equal(block.querySelector('strong').textContent, 'Главный вывод:');
+  assert.equal(block.querySelector('em').textContent, 'важно');
+  assert.match(block.querySelector('p').textContent, /foo_bar_baz 2\*3\*4/, 'identifiers and arithmetic stay as written');
+  assert.deepEqual([...block.querySelectorAll('th')].map(cell => cell.textContent), ['Метрика', 'Значение']);
+  assert.deepEqual([...block.querySelectorAll('tbody tr')].map(row => [...row.children].map(cell => cell.textContent)), [['Записей', '28 060'], ['Код', 'x|y']]);
+  assert.equal(block.querySelector('th:last-child').dataset.align, 'right');
+  assert.equal(block.querySelector('ul ul li').textContent, 'вложенный');
+  assert.equal(block.querySelectorAll('ol li').length, 2);
+  assert.equal(block.querySelector('blockquote').textContent, 'цитата');
+  assert.equal(block.querySelector('pre code').textContent, 'const a = "**не жирный**";');
+  assert.equal(block.querySelector('img'), null, 'HTML stays text');
+  assert.match(block.textContent, /<img src=x onerror=alert\(1\)>/);
+  assert.deepEqual([...block.querySelectorAll('a')].map(link => link.getAttribute('href')), ['https://example.com/a', 'https://example.org/b']);
+  assert.match(block.textContent, /\[плохая\]\(javascript:alert\(1\)\)/);
+  assert.equal(block.querySelector('a').getAttribute('rel'), 'noopener noreferrer');
 });
 
-test('reviewer and fixer can be any agent, profile and model in the UI', async () => {
-  for (const maxFixes of ['0', '2']) {
-    const p = await page();
-    try {
-      const form = p.document.querySelector('#preset-form');
-      const change = name => form.elements[name].dispatchEvent(new p.window.Event('change'));
-      form.elements.name.value = 'Mixed roles';
-      form.elements.mode.value = 'review'; change('mode');
-      form.elements.reviewAgent.value = 'claude'; change('reviewAgent');
-      assert.equal(form.elements.reviewProfile.options.length, 3);
-      form.elements.reviewProfile.value = 'litellm'; form.elements.reviewModel.value = 'review-model';
-      form.elements.maxFixes.value = maxFixes; change('maxFixes');
-      assert.equal(form.querySelector('[data-fixer-options]').hidden, true);
-      form.elements.fixerAgent.value = 'codex'; change('fixerAgent');
-      assert.equal(form.querySelector('[data-fixer-options]').hidden, false);
-      assert.equal(form.elements.fixerProfile.value, 'default');
-      form.elements.fixerModel.value = 'fixer-model';
-      form.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-      await waitFor(() => p.calls.some(c => c.url === '/api/preset'));
-      const preset = p.calls.find(c => c.url === '/api/preset').input.preset;
-      assert.deepEqual(preset.workflow.reviewer, { agent: 'claude', profile: 'litellm', model: 'review-model', instructions: '' });
-      // Without automatic fixes a chosen fixer has nothing to do, so it is not submitted.
-      assert.deepEqual(preset.workflow.fixer, maxFixes === '0' ? undefined : { agent: 'codex', profile: 'default', model: 'fixer-model' });
-    } finally { await p.close(); }
-  }
+test('a card shows Markdown as plain words', async () => {
+  const view = await page({ tasks: [{ ...task, status: 'готово', latest: { kind: 'report', text: '**Вывод:** `ok`\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n- [пункт](https://example.com)' } }] });
+  const { document } = view;
+  await waitFor(() => document.querySelector('.task-latest'));
+  assert.equal(document.querySelector('.task-latest').textContent, 'Отчёт: Вывод: ok A · B 1 · 2 • пункт');
 });
 
-test('review findings render as inert text with criterion status and snapshot validity', async () => {
-  const task = { id: 'task-1', projectId: 'project', agent: 'codex', profile: 'default', title: 'Review task', description: 'Fix it', criteria: 'Fixed', workflow: { mode: 'review', checkIds: [], reviewer: { agent: 'codex', model: '', instructions: '' } }, createdAt: new Date().toISOString(), status: 'требуется решение' };
-  const p = await page({ tasks: [task] });
-  try {
-    p.setAttempts([{ id: 'attempt-1', taskId: task.id, agent: 'codex', status: task.status, profile: 'default', directory: project.path, events: [], output: 'Done', checks: 'не настроены', review: 'есть замечания', workflow: task.workflow, startedAt: new Date().toISOString(), endedAt: new Date().toISOString(),
-      reviewRun: { status: 'есть замечания', validity: 'совпадает', scope: 'Весь checkout', result: { summary: '<script>bad()</script>', criteria: [{ criterion: 'Works', status: 'unmet', evidence: 'Counterexample' }], findings: [{ severity: 'P1', title: 'Bug', file: 'file.mjs', line: 1, evidence: 'Wrong return' }], limitations: ['No tests'] } } }]);
-    p.window.location.hash = 'task/task-1'; await waitFor(() => p.document.querySelector('.review-panel'));
-    const panel = p.document.querySelector('.review-panel');
-    assert.match(panel.textContent, /Не выполнен/); assert.match(panel.textContent, /file.mjs:1/); assert.match(panel.textContent, /совпадает/);
-    assert.equal(panel.querySelector('script'), null); assert.match(panel.textContent, /<script>bad/);
-  } finally { await p.close(); }
+test('a node names the model that really worked and what it spent; the supervisor is in the header', async () => {
+  const usage = [{ model: 'claude-opus-5-5', input: 1000, output: 500, cacheRead: 90000, cacheWrite: 2000, costUsd: 0.5 }];
+  const run = { ...baseRun, active: false, status: 'готово', phase: '', supervisorUsage: [{ model: 'claude-haiku-5-5', input: 10, output: 5, cacheRead: 0, cacheWrite: 0, costUsd: null }], workers: [{ ...baseRun.workers[0], model: '', status: 'готово', answer: 'Да', usage }] };
+  const view = await page({ tasks: [{ ...task, status: 'готово' }] }, run);
+  await open(view);
+  const { document } = view;
+  await waitFor(() => document.querySelector('[data-node=w1]'));
+  assert.match(document.querySelector('[data-node=w1]').textContent, /opus-5-5/);
+  assert.match(document.querySelector('[data-node=w1]').textContent, /3,5k ток\./, 'cache reads are not counted as spent');
+  assert.match(document.querySelector('.workflow-route').textContent, /haiku-5-5 · 15 ток\./);
+  assert.match(document.querySelector('.inspector').textContent, /чтение 90.000, оценка \$0\.500/);
 });
 
-test('automation options are explicit, saved in a preset and disclosed before launch', async () => {
-  const p = await page();
-  try {
-    const preset = p.document.querySelector('#preset-form');
-    assert.equal(preset.elements.maxFixes.value, '0');
-    preset.elements.name.value = 'Bounded fixes';
-    preset.elements.mode.value = 'review'; preset.elements.mode.dispatchEvent(new p.window.Event('change'));
-    preset.elements.maxFixes.value = '2'; preset.elements.maxFixes.dispatchEvent(new p.window.Event('change'));
-    assert.equal(preset.querySelector('[data-automation-settings]').hidden, false);
-    preset.elements.timeBudgetMinutes.value = '15'; preset.elements.fixChecks.checked = false;
-    preset.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-    await waitFor(() => p.calls.some(c => c.url === '/api/preset'));
-    assert.deepEqual(p.calls.find(c => c.url === '/api/preset').input.preset.workflow.automation,
-      { maxFixes: 2, timeBudgetMinutes: 15, fixChecks: false, fixReview: true });
-    const form = p.document.querySelector('#task');
-    await waitFor(() => Array.from(form.elements.presetId.options).some(o => o.value === 'new-preset'));
-    form.elements.presetId.value = 'new-preset'; form.elements.presetId.dispatchEvent(new p.window.Event('change'));
-    assert.equal(form.elements.maxFixes.value, '2'); assert.equal(form.elements.maxFixes.disabled, true);
-    form.elements.description.value = 'Fix with review';
-    form.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-    await waitFor(() => p.document.querySelector('.launch-preview button'));
-    assert.match(p.document.querySelector('.launch-preview').textContent, /до 2 автоматических исправлений/);
-    assert.match(p.document.querySelector('.launch-preview').textContent, /15 мин/);
-    assert.equal(p.calls.some(c => c.url === '/api/attempt-start'), false);
-  } finally { await p.close(); }
+test('the usage page shows limits with their age, agents and tasks, and never a price it cannot know', async () => {
+  const bucket = fields => ({ runs: 2, partial: 0, input: 1000, output: 500, cacheRead: 9000, cacheWrite: 200, costUsd: null, ...fields });
+  const view = await page({ tasks: [task] });
+  view.context.usage = { firstAt: '2026-11-01T10:00:00Z', totals: bucket({ costUsd: 1.5, partial: 1 }), agents: [bucket({ id: 'claude-subscription', label: 'Claude · подписка', costUsd: 1.5 }), bucket({ id: 'claude-deepseek', label: 'Claude · DeepSeek' })], models: [bucket({ model: 'claude-opus-5-5' }), bucket({ model: '' })], roles: [bucket({ kind: 'supervisor' })], tasks: [bucket({ taskId: 'task-1', title: 'Исправить add' }), bucket({ taskId: 'gone', title: null })],
+    limits: [{ agentId: 'claude-subscription', label: 'Claude · подписка', observedAt: new Date().toISOString(), windows: [{ name: 'five_hour', utilization: 0.41, resetsAt: new Date(Date.now() + 3600000).toISOString() }, { name: 'seven_day', utilization: 0.9, resetsAt: new Date(Date.now() - 1000).toISOString() }] }] };
+  view.window.location.hash = '#usage';
+  const { document, calls } = view;
+  await waitFor(() => document.querySelector('.usage-table'));
+  const text = document.querySelector('#usage-report').textContent;
+  assert.match(text, /5 часов41%/); assert.match(text, /по данным последнего запуска/);
+  assert.match(text, /окно обновилось/, 'a window that has reset does not show a stale percent');
+  assert.equal(document.querySelectorAll('[role=meter]').length, 1);
+  assert.match(text, /Удалённая задача/); assert.match(text, /Модель из настроек CLI/); assert.match(text, /остановленных до итогов: 1/);
+  const row = [...document.querySelectorAll('.usage-table tr')].find(item => /DeepSeek/.test(item.textContent));
+  assert.equal(row.lastElementChild.textContent, '—');
+  assert.equal(document.querySelector('.usage-table a').getAttribute('href'), '#task/task-1');
+  document.querySelector('[data-usage-period=all]').click();
+  await waitFor(() => calls.filter(call => call.url === '/api/usage').at(-1).input.from === null);
+  await delay(30); // Lets the answer arrive before the window closes.
 });
 
-const graphPreset = { id: 'graph', name: 'С ролями', profile: 'subscription', instructions: '', workflow: { mode: 'graph', graph: { start: 'plan', limits: { maxLoops: 2, timeBudgetMinutes: 60 }, nodes: [
-  { id: 'plan', name: 'Гейм-дизайнер', kind: 'read', agent: 'codex', profile: 'default', model: '', instructions: '', next: { success: 'ok' } },
-  { id: 'ok', name: 'Подтвердить план', kind: 'human', instructions: 'Подходит ли план?', next: { success: 'exec', failure: 'plan' } },
-  { id: 'exec', name: 'Исполнитель', kind: 'executor', next: {} }] } } };
-test('the graph stays out of the way: a new task is one agent, and the editor appears only when chosen', async () => {
-  const p = await page({ presets: [structuredClone(graphPreset)], projects: [{ ...structuredClone(project), defaultPresetId: '' }] });
-  try {
-    const task = p.document.querySelector('#task'), form = p.document.querySelector('#preset-form');
-    assert.equal(task.elements.workflowMode.value, 'quick');
-    assert.equal(p.document.querySelector('#graph-editor').hidden, true);
-    assert.equal(Array.from(task.elements.workflowMode.options).find(o => o.value === 'graph').hidden, true);
-    task.elements.presetId.value = 'graph'; task.elements.presetId.dispatchEvent(new p.window.Event('change'));
-    assert.match(p.document.querySelector('#process-summary').textContent, /Гейм-дизайнер → Подтвердить план → Исполнитель/);
-    assert.equal(p.document.querySelector('#task-checks').hidden, true);
-
-    form.elements.mode.value = 'graph'; form.elements.mode.dispatchEvent(new p.window.Event('change'));
-    assert.equal(p.document.querySelector('#graph-editor').hidden, false);
-    assert.match(p.document.querySelector('#graph-editor').textContent, /Необязательно/);
-    assert.equal(p.document.querySelectorAll('.graph-node').length, 1);
-    const template = p.document.querySelector('#graph-editor select');
-    template.value = 'roles'; template.dispatchEvent(new p.window.Event('change'));
-    assert.equal(p.document.querySelectorAll('.graph-node').length, 2);
-    assert.match(p.document.querySelector('.graph-map').textContent, /Продюсер \(совещательная\)/);
-    const add = Array.from(p.document.querySelectorAll('#graph-editor button')).find(b => b.textContent === 'Добавить шаг'); add.click();
-    assert.equal(p.document.querySelectorAll('.graph-node').length, 3);
-    form.elements.name.value = 'С ролями 2';
-    form.dispatchEvent(new p.window.Event('submit', { bubbles: true, cancelable: true }));
-    await waitFor(() => p.calls.some(c => c.url === '/api/preset'));
-    const saved = p.calls.find(c => c.url === '/api/preset').input.preset.workflow;
-    assert.equal(saved.mode, 'graph'); assert.equal(saved.graph.nodes.length, 3); assert.equal(saved.graph.nodes[1].members[1].blocking, false); assert.equal(saved.checkIds, undefined);
-  } finally { await p.close(); }
-});
-test('the schema draws the route, marks loops and unreachable steps, and picks a step for editing', async () => {
-  const p = await page();
-  try {
-    const form = p.document.querySelector('#preset-form');
-    form.elements.mode.value = 'graph'; form.elements.mode.dispatchEvent(new p.window.Event('change'));
-    const template = p.document.querySelector('#graph-editor select');
-    template.value = 'planned'; template.dispatchEvent(new p.window.Event('change'));
-    const svg = p.document.querySelector('#graph-editor svg.graph-diagram');
-    const boxes = () => Array.from(p.document.querySelectorAll('#graph-editor .graph-box'));
-    assert.deepEqual(boxes().map(box => box.getAttribute('data-node')), ['plan', 'approve', 'exec', 'checks', 'review']);
-    assert.equal(p.document.querySelectorAll('#graph-editor .graph-end').length, 1);
-    // Rejecting the plan, failed checks and review findings are the three dashed returns.
-    assert.equal(svg.querySelectorAll('path.graph-edge.failure').length, 3);
-    assert.equal(svg.querySelectorAll('path.graph-edge:not(.failure)').length, 5);
-    assert.match(svg.textContent, /Гейм-дизайнер/); assert.match(svg.textContent, /ревью: ролей 1/);
-    const review = boxes().find(box => box.getAttribute('data-node') === 'review');
-    review.dispatchEvent(new p.window.MouseEvent('click', { bubbles: true }));
-    assert.equal(p.document.querySelector('.graph-node.selected').dataset.graphStep, 'review');
-    assert.equal(p.document.activeElement, p.document.querySelector('.graph-node.selected input'));
-    Array.from(p.document.querySelectorAll('#graph-editor button')).find(b => b.textContent === 'Добавить шаг').click();
-    const added = boxes().at(-1);
-    assert.match(added.getAttribute('class'), /unreachable/); assert.match(added.textContent, /недостижим/);
-  } finally { await p.close(); }
-});
-test('a waiting step offers a decision, and every step and role shows its own result', async () => {
-  const taskRecord = { id: 'task-1', projectId: 'project', title: 'Task', description: 'D', criteria: 'C', agent: 'claude', profile: 'subscription', status: 'ждёт решения', createdAt: new Date().toISOString(), workflow: { ...graphPreset.workflow, checkIds: [] } };
-  const p = await page({ tasks: [taskRecord] });
-  try {
-    const reader = { id: 's1', nodeId: 'plan', name: 'Гейм-дизайнер', kind: 'read', agent: 'codex', profile: 'default', model: '', visit: 1, status: 'выполнение завершено', output: 'План <img src=x>', outputTruncated: false, diagnostics: { output: '' } };
-    const report = { id: 's2', nodeId: 'review', memberId: 'prod', name: 'Продюсер', kind: 'review', blocking: false, agent: 'codex', profile: 'default', model: '', visit: 1, status: 'есть замечания', validity: 'совпадает', scope: 'Весь checkout', output: '', diagnostics: { output: '' },
-      result: { summary: 'Итог', verdict: 'changes_requested', findings: [{ severity: 'P0', title: 'Срок', file: null, line: null, evidence: 'Три системы' }], criteria: [{ criterion: 'Срок', status: 'met', evidence: 'Да' }], limitations: [] } };
-    const waiting = { id: 's3', nodeId: 'ok', name: 'Подтвердить план', kind: 'human', visit: 1, status: 'ждёт решения', instructions: 'Подходит ли план?' };
-    p.setAttempts([{ id: 'attempt-1', taskId: 'task-1', status: 'ждёт решения', profile: 'subscription', directory: project.path, events: [], output: '', checks: 'не запрошены', review: 'не запрошено', workflow: taskRecord.workflow, startedAt: new Date().toISOString(), endedAt: new Date().toISOString(),
-      automation: { reason: 'Шаг «Подтвердить план» ждёт решения пользователя.', deadlineAt: new Date().toISOString() }, graphRun: { cursor: 'ok', steps: [reader, report, waiting], waiting: { nodeId: 'ok', stepId: 's3' }, decisions: [] } }]);
-    p.window.location.hash = 'task/task-1';
-    await waitFor(() => p.document.querySelector('.graph-decision'));
-    const text = p.document.querySelector('.graph-steps').textContent;
-    assert.match(text, /План <img src=x>/); assert.equal(p.document.querySelector('.graph-steps img'), null);
-    assert.match(text, /Совещательная роль/); assert.match(text, /Относится к задаче в целом/);
-    assert.ok(!Array.from(p.document.querySelectorAll('.graph-steps button')).some(b => /Передать замечания/.test(b.textContent)), 'an advisory report cannot be sent for fixing');
-    assert.match(p.document.querySelector('[data-phase]').textContent, /ждёт твоего решения/);
-    const box = id => p.document.querySelector(`.automation-progress .graph-box[data-node="${id}"]`);
-    assert.match(box('plan').getAttribute('class'), /tone-ok/);
-    assert.match(box('ok').getAttribute('class'), /tone-waiting/); assert.match(box('ok').getAttribute('class'), /current/);
-    assert.equal(box('exec').getAttribute('tabindex'), null, 'a step that has not run has nothing to show'); assert.match(box('exec').textContent, /не запускался/);
-    const planStep = p.document.querySelector('.graph-steps [data-graph-node="plan"]'); planStep.open = false;
-    box('plan').dispatchEvent(new p.window.MouseEvent('click', { bubbles: true }));
-    assert.equal(planStep.open, true);
-    p.document.querySelector('.graph-decision textarea').value = 'Без баланса';
-    Array.from(p.document.querySelectorAll('.graph-decision button')).find(b => b.textContent === 'Отклонить').click();
-    await waitFor(() => p.calls.some(c => c.url === '/api/attempt-decide'));
-    assert.deepEqual(p.calls.find(c => c.url === '/api/attempt-decide').input, { taskId: 'task-1', attemptId: 'attempt-1', approved: false, comment: 'Без баланса' });
-  } finally { await p.close(); }
-});
-test('active automation exposes hold and preserves prior pass output in history', async () => {
-  const workflow = { mode: 'review', checkIds: [], reviewer: { agent: 'codex', model: '', instructions: '' }, automation: { maxFixes: 2, timeBudgetMinutes: 30, fixChecks: true, fixReview: true } };
-  const task = { id: 'task-1', projectId: 'project', profile: 'subscription', title: 'Automatic fix', description: 'Fix', criteria: 'Works', workflow, status: 'выполнение', createdAt: new Date().toISOString() };
-  const p = await page({ tasks: [task] });
-  try {
-    p.setAttempts([{ id: 'a', taskId: task.id, profile: 'subscription', directory: project.path, workflow, status: 'выполнение', active: true, events: [], output: 'Current answer', startedAt: new Date().toISOString(),
-      automation: { currentFix: 1, deadlineAt: new Date(Date.now() + 60000).toISOString(), stopAfterPass: false },
-      cycles: [{ index: 0, checks: 'есть ошибки', review: 'есть замечания', output: '<script>Previous answer</script>' }] }]);
-    p.window.location.hash = 'task/task-1';
-    await waitFor(() => p.document.querySelector('.automation-progress'));
-    assert.match(p.document.querySelector('.automation-progress').textContent, /Исправление 1 из 2/);
-    assert.match(p.document.querySelector('.cycle-history').textContent, /Previous answer/);
-    assert.equal(p.document.querySelector('.cycle-history script'), null);
-    const hold = Array.from(p.document.querySelectorAll('button')).find(b => b.textContent === 'Не продолжать автоматически');
-    assert.equal(hold.hidden, false); hold.click();
-    await waitFor(() => p.calls.some(c => c.url === '/api/attempt-hold'));
-    assert.deepEqual(p.calls.find(c => c.url === '/api/attempt-hold').input, { taskId: task.id });
-    await waitFor(() => hold.textContent === 'Следующий цикл отменён');
-    assert.equal(hold.disabled, true);
-  } finally { await p.close(); }
+test('a refused action can be allowed only through the button, naming the exact rule', async () => {
+  const run = { ...baseRun, active: false, status: 'требуется решение', phase: '', workers: [{ ...baseRun.workers[0], status: 'отказ в правах', denials: [{ tool: 'Bash', detail: 'dotnet build', rule: 'Bash(dotnet build)' }, { tool: 'Edit', detail: 'x', rule: null }] }] };
+  const view = await page({ tasks: [{ ...task, status: 'требуется решение' }] }, run);
+  await open(view);
+  const { document, calls } = view;
+  await waitFor(() => document.querySelector('.denials'));
+  const panel = document.querySelector('.denials');
+  assert.match(panel.textContent, /Bash\(dotnet build\)/); assert.match(panel.textContent, /точное разрешение выдать нельзя/);
+  panel.querySelector('button').click();
+  await waitFor(() => calls.some(call => call.url === '/api/run-message'));
+  assert.equal(calls.find(call => call.url === '/api/run-message').input.allowDenied, true);
 });
 
-test('board groups tasks by status, keeps filters and remembers the view and theme', async () => {
-  const base = { projectId: 'project', profile: 'subscription', description: 'Fix', criteria: 'Works', workflow: { mode: 'quick', checkIds: [] }, createdAt: new Date().toISOString() };
-  const p = await page({ tasks: [{ ...base, id: 'a', title: 'Denied', status: 'требуется решение' }, { ...base, id: 'b', title: 'Running', status: 'выполнение' }, { ...base, id: 'c', title: 'Answered', status: 'выполнение завершено' }, { ...base, id: 'd', title: 'New', status: 'создана' }] });
-  try {
-    const { document } = p;
-    assert.equal(document.querySelector('.board'), null, 'A narrow window starts with the list');
-    assert.equal(document.querySelectorAll('.task-row').length, 4);
-    document.querySelector('[data-view-choice=board]').click();
-    const columns = () => Array.from(document.querySelectorAll('.board-column'), column => [column.querySelector('h2 span').textContent, Array.from(column.querySelectorAll('.task-row h3'), title => title.textContent)]);
-    assert.deepEqual(columns(), [['Требуют внимания', ['Denied']], ['В работе', ['Running']], ['Ответ получен', ['Answered']], ['Не запущены', ['New']]]);
-    assert.equal(document.querySelector('#count-created').textContent, '1');
-    assert.equal(p.window.localStorage.getItem('taskroom.view'), 'board');
-    document.querySelector('.stat[data-filter=attention]').click();
-    assert.deepEqual(columns(), [['Требуют внимания', ['Denied']]]);
-    assert.equal(document.querySelector('.stat[data-filter=attention]').getAttribute('aria-pressed'), 'true');
-    const search = document.querySelector('#task-search'); search.value = 'missing'; search.dispatchEvent(new p.window.Event('input'));
-    assert.equal(document.querySelector('.board'), null); assert.match(document.querySelector('.empty-state').textContent, /Ничего не найдено/);
-    assert.equal(document.querySelector('[data-theme-choice=dark]').getAttribute('aria-pressed'), 'true');
-    document.querySelector('[data-theme-choice=light]').click();
-    assert.equal(document.documentElement.dataset.theme, 'light');
-    assert.equal(p.window.localStorage.getItem('taskroom.theme'), 'light');
-    document.querySelector('[data-theme-choice=dark]').click();
-    assert.equal(document.documentElement.dataset.theme, undefined);
-  } finally { await p.close(); }
+test('a task that never ran can be started; the full log is loaded on request', async () => {
+  const view = await page({ tasks: [{ ...task, status: 'создана', legacy: true }] }, null);
+  await open(view);
+  const { document, calls } = view;
+  await waitFor(() => /не запускалась/.test(document.querySelector('.phase').textContent));
+  assert.match(document.querySelector('.task-head').textContent, /прежней версии/);
+  const start = document.querySelector('.run-controls button');
+  assert.equal(start.hidden, false); start.click();
+  await waitFor(() => calls.some(call => call.url === '/api/run-start'));
+  view.context.run = { ...baseRun, active: false, status: 'готово', workers: [{ ...baseRun.workers[0], logTrimmed: true }] };
+  await waitFor(() => [...document.querySelectorAll('button')].some(button => button.textContent === 'Показать весь журнал'));
+  [...document.querySelectorAll('button')].find(button => button.textContent === 'Показать весь журнал').click();
+  await waitFor(() => /полный журнал/.test(document.querySelector('[data-worker=w1]').textContent));
+});
+
+test('the team settings save the supervisor and the chosen workers', async () => {
+  const view = await page();
+  view.window.location.hash = '#settings';
+  const { document, calls } = view;
+  await waitFor(() => document.querySelectorAll('#team-workers [data-worker-option]').length === 4);
+  assert.equal(document.querySelector('[data-worker-option=codex] [data-note]').value, 'для ревью');
+  document.querySelector('[data-worker-option=claude-litellm] [data-enabled]').checked = true;
+  document.querySelector('[data-worker-option=claude-subscription] [data-enabled]').checked = false;
+  document.querySelector('#team').elements.supervisorModel.value = 'haiku';
+  document.querySelector('#team').dispatchEvent(new view.window.Event('submit', { cancelable: true, bubbles: true }));
+  await waitFor(() => calls.some(call => call.url === '/api/settings'));
+  const saved = calls.find(call => call.url === '/api/settings').input;
+  assert.equal(saved.supervisor.model, 'haiku');
+  assert.deepEqual(saved.workers.map(worker => worker.id), ['claude-litellm', 'codex']);
+  await waitFor(() => /Сохранено/.test(document.querySelector('#team-result').textContent));
+});
+
+test('the dashboard groups tasks by what they need from you', async () => {
+  const tasks = [{ ...task, id: 'a', status: 'ждёт ответа' }, { ...task, id: 'b', status: 'выполнение' }, { ...task, id: 'c', status: 'в очереди' }, { ...task, id: 'd', status: 'готово' }, { ...task, id: 'e', status: 'ошибка' }, { ...task, id: 'f', status: 'создана' }];
+  const view = await page({ tasks });
+  const { document } = view;
+  await waitFor(() => document.querySelector('#count-all').textContent === '6');
+  assert.equal(document.querySelector('#count-attention').textContent, '2');
+  assert.equal(document.querySelector('#count-active').textContent, '2');
+  assert.equal(document.querySelector('#count-response').textContent, '1');
+  assert.equal(document.querySelector('#count-created').textContent, '1');
+});
+
+const imageFile = (window, name = 'a.png', type = 'image/png', size = 8) => new window.File([new Uint8Array(size).fill(1)], name, { type });
+async function attach(window, form, files) {
+  const input = form.querySelector('input[type=file]');
+  Object.defineProperty(input, 'files', { configurable: true, value: files });
+  input.dispatchEvent(new window.Event('change'));
+  await delay(20);
+}
+test('a picture can be attached to a new task, removed, and is sent with it', async () => {
+  const view = await page();
+  const { document, window, calls } = view, form = document.querySelector('#task');
+  document.querySelector('#new-task').click();
+  document.querySelector('#task-description').value = 'Посмотри снимок';
+  await attach(window, form, [imageFile(window), imageFile(window, 'b.png')]);
+  await waitFor(() => form.querySelectorAll('.image-preview').length === 2);
+  form.querySelector('.image-preview button').click();
+  assert.equal(form.querySelectorAll('.image-preview').length, 1);
+  await attach(window, form, [imageFile(window, 'c.svg', 'image/svg+xml')]);
+  assert.match(form.querySelector('.image-error').textContent, /PNG, JPEG/);
+  assert.equal(form.querySelectorAll('.image-preview').length, 1);
+  await attach(window, form, [imageFile(window, 'big.png', 'image/png', 4 * 1024 * 1024)]);
+  assert.match(form.querySelector('.image-error').textContent, /3,75 МБ/);
+  form.requestSubmit();
+  await waitFor(() => calls.some(call => call.url === '/api/tasks'));
+  const { input } = calls.find(call => call.url === '/api/tasks');
+  assert.equal(input.images.length, 1); assert.equal(Buffer.from(input.images[0].data, 'base64').length, 8);
+  await waitFor(() => !form.querySelectorAll('.image-preview').length);
+});
+test('a task without pictures sends none', async () => {
+  const view = await page();
+  const { document, calls } = view;
+  document.querySelector('#new-task').click();
+  document.querySelector('#task-description').value = 'Только текст';
+  document.querySelector('#task').requestSubmit();
+  await waitFor(() => calls.some(call => call.url === '/api/tasks'));
+  assert.ok(!('images' in calls.find(call => call.url === '/api/tasks').input));
+});
+test('attached pictures are shown on the task page and a reply can carry more', async () => {
+  const withImages = { ...task, status: 'готово', images: [{ id: 'img-1', type: 'image/png', size: 8 }] };
+  const run = { ...structuredClone(baseRun), active: false, status: 'готово', workers: [], journal: [{ kind: 'user', text: 'Исправить add', images: ['img-1'] }, { kind: 'user', text: 'Вот ещё', images: ['img-2'] }] };
+  const view = await page({ tasks: [withImages] }, run);
+  const { document, window, calls } = view;
+  window.location.hash = `task/${task.id}`;
+  await waitFor(() => document.querySelector('[data-node=j1]'));
+  document.querySelector('[data-node=j1]').click();
+  await waitFor(() => document.querySelector('.image-gallery img')?.getAttribute('src') === `/images/${task.id}/img-2`);
+  assert.equal(document.querySelector('.image-gallery a').getAttribute('rel'), 'noopener');
+  assert.match(document.querySelector('[data-node=j1]').textContent, /изображений: 1/);
+  document.querySelector('[data-node=task]').click();
+  await waitFor(() => document.querySelector('.image-gallery img')?.getAttribute('src') === `/images/${task.id}/img-1`);
+
+  const reply = document.querySelector('form.reply');
+  await waitFor(() => !reply.hidden);
+  reply.querySelector('textarea').value = 'Смотри';
+  await attach(window, reply, [imageFile(window)]);
+  await waitFor(() => reply.querySelector('.image-preview'));
+  reply.requestSubmit();
+  await waitFor(() => calls.some(call => call.url === '/api/run-message'));
+  assert.equal(calls.find(call => call.url === '/api/run-message').input.images.length, 1);
+  await waitFor(() => !reply.querySelector('.image-preview'));
 });
